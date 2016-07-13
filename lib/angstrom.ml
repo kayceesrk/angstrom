@@ -651,9 +651,12 @@ module Z = struct
   let sep_by s p =
     (lift2 cons p ((s *> sep_by1 s p) <|> return [])) <|> return []
 
-  let skip_many p =
-    fix (fun m ->
-      (p *> m) <|> return ())
+  let rec skip_many p =
+    fun input pos more ->
+      match p input pos more with
+      | D(_    , pos) -> skip_many p input pos more
+      | F(marks, msg) -> D((), pos)
+      | P(k    , pos) -> P(k *> skip_many p, pos)
 
   let skip_many1 p =
     p *> skip_many p
