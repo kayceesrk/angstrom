@@ -56,6 +56,8 @@ module Input = struct
     ; input
     }
 
+  let get_input {input} = input
+
   let length { initial_committed; input}  =
     input_length input + initial_committed
 
@@ -314,16 +316,16 @@ let cons x xs = x :: xs
 
 module Z = struct
 
-  type st =
+  type 'a st =
     { input : Input.t
     ; more : more
-    ; mutable pos : int }
-
-  type 'a t =
-    st -> 'a
+    ; mutable pos : int
+    ; wrap_exn : 'a t -> exn
+    ; unwrap_exn : exn -> 'a t}
+  and 'a t =
+    'a st -> 'a
 
   exception F of string list * string
-  exception P : 'a t -> exn
 
   type 'a state =
     | Partial of 'a partial
@@ -335,14 +337,24 @@ module Z = struct
   let fail_to_string marks err =
     String.concat " > " marks ^ ": " ^ err
 
-  let rec _parse (type a) (p:a t) input pos more : a =
-    try Done(p { input; pos; more })
-    with
-    | F(marks, msg) -> Fail(marks, msg)
-    | P p' ->
-      let committed = Input.committed input in
-      Partial (fun input more ->
-        _parse p' (Input.create committed input) pos more)
+  let rec _parse (type a) (p : a t) input pos more : a state =
+    let module M = struct exception P : a t -> exn end in
+    let wrap_exn z = M.P z in
+    let unwrap_exn e =
+      match e with
+        M.P v -> v
+      | _ -> raise e
+    in
+    let rec loop p input pos more =
+      try Done(p { input; pos; more; wrap_exn; unwrap_exn})
+      with
+      | F(marks, msg) -> Fail(marks, msg)
+      | M.P p' ->
+        let committed = Input.committed input in
+        Partial (fun input more ->
+          loop p' (Input.create committed @@ Input.get_input input) pos more)
+    in
+    loop p input pos more
 
   let rec parse ?(input=`String "") p =
     _parse p Input.(create 0 input) 0 Incomplete
@@ -361,33 +373,34 @@ module Z = struct
 
   let rec (>>=) p f =
     fun st ->
-      f (try p st with P k -> raise (P(k >>= f))) st
+      f (try p st with e -> raise (st.wrap_exn(st.unwrap_exn e >>= f))) st
 
   let rec (>>|) p f =
     fun st ->
-      f (try p st with P k -> raise (P(k >>| f)))
+      f (try p st with e -> raise (st.wrap_exn(st.unwrap_exn e >>| f)))
 
   let rec ( *>) p1 p2 =
-    ignore (try p1 st with P k -> raise (P(k *> p2)));
-    p2 st
+    fun st ->
+      ignore (try p1 st with e -> raise (st.wrap_exn(st.unwrap_exn e *> p2)));
+      p2 st
 
   let rec (<* ) p1 p2 =
     fun st ->
-      let x = try p1 st with P k -> raise (P(k <* p2)) in
-      ignore (try p2 st with P k -> raise (P(k >>| fun _ -> x)));
+      let x = try p1 st with e -> raise (st.wrap_exn(st.unwrap_exn e <* p2)) in
+      ignore (try p2 st with e -> raise (st.wrap_exn(st.unwrap_exn e >>| fun _ -> x)));
       x
 
   let rec (<?>) p mark =
     fun st ->
       try p st with
       | F(marks, msg) -> raise (F(mark::marks, msg))
-      | P k           -> raise (P(k <?> mark))
+      | e -> raise (st.wrap_exn(st.unwrap_exn e <?> mark))
 
   let rec (<|>) p q =
     fun st ->
       try p st with
       | F _ -> q st
-      | P k -> raise (P(k <|> q))
+      | e -> raise (st.wrap_exn(st.unwrap_exn e <|> q))
 
   let choice ps =
     List.fold_right (<|>) ps (fail "empty")
@@ -403,8 +416,8 @@ module Z = struct
 
   let rec lift2 f p1 p2 =
     fun st ->
-      let x = try p1 st with P k -> raise (P(lift2 f k p2)) in
-      let y = try p2 st with P k -> raise (P(k >>| fun y -> f x y)) in
+      let x = try p1 st with e -> raise (st.wrap_exn(lift2 f (st.unwrap_exn e) p2)) in
+      let y = try p2 st with e -> raise (st.wrap_exn(st.unwrap_exn e >>| fun y -> f x y)) in
       f x y
 
   let rec lift3 f p1 p2 p3 =
@@ -418,7 +431,7 @@ module Z = struct
     let rec go ({ input; pos; more } as st) =
       if pos < Input.length input then
         match f (Input.get input pos) with
-        | None -> raise F([], msg)
+        | None -> raise (F([], msg))
         | Some v -> st.pos <- pos + 1; v
       else if more = Incomplete then
         raise (F([], msg))
@@ -564,7 +577,7 @@ module Z = struct
   let take_till f =
     take_while (fun c -> not (f c))
 
-  let rec take_rest = 
+  let rec take_rest =
     fun ({ input; pos; more } as st) ->
       let len = Input.length input in
       if pos < len then
